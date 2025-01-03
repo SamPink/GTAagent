@@ -5,6 +5,7 @@ using System.IO;
 using GTA;
 using GTA.Math;
 using GTA.Native;
+
 public class AutoDriver : Script {
     private Vehicle currentVehicle;
     private bool isActive = false;
@@ -49,7 +50,6 @@ public class AutoDriver : Script {
                 lastUpdateTime = Game.GameTime;
                 isActive = true;
                 
-                // Start driving to airport
                 DriveToDestination();
                 
                 Logger.Log("Vehicle created and driving task started");
@@ -75,34 +75,182 @@ public class AutoDriver : Script {
     private void DriveToDestination() {
         try {
             Ped driver = Game.Player.Character;
-            if (driver != null && currentVehicle != null) {
-                // Clear any existing tasks
-                driver.Task.ClearAll();
-                
-                // Set driving style flags
-                int drivingStyle = 447; // Normal driving style + avoid obstacles
-                float cruiseSpeed = 20f; // Speed in m/s (about 45mph)
-                
-                // Start the driving task
+            if (driver == null || currentVehicle == null) {
+                Logger.Log("Driver or vehicle is null");
+                return;
+            }
+
+            // Clear any existing tasks first
+            driver.Task.ClearAll();
+            
+            // Calculate driving parameters based on environment and conditions
+            float cruiseSpeed = CalculateOptimalSpeed();
+            int drivingStyle = CalculateDrivingStyle();
+            
+            // Create waypoint path to destination
+            var waypoints = GenerateWaypoints(currentVehicle.Position, AIRPORT_DESTINATION);
+            
+            foreach (var waypoint in waypoints) {
                 Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD,
-                    driver.Handle,                 // Ped handle
-                    currentVehicle.Handle,         // Vehicle handle
-                    AIRPORT_DESTINATION.X,         // X coordinate
-                    AIRPORT_DESTINATION.Y,         // Y coordinate
-                    AIRPORT_DESTINATION.Z,         // Z coordinate
-                    cruiseSpeed,                   // Speed
-                    1.0f,                         // Don't stop at destination
-                    currentVehicle.Model.Hash,     // Vehicle hash
-                    drivingStyle,                  // Driving style
-                    5.0f,                         // Stop range
-                    20.0f                         // Straighten out range
+                    driver.Handle,             // Ped handle
+                    currentVehicle.Handle,     // Vehicle handle
+                    waypoint.X,                // X coordinate
+                    waypoint.Y,                // Y coordinate
+                    waypoint.Z,                // Z coordinate
+                    cruiseSpeed,               // Speed
+                    1.0f,                      // Stop at end
+                    currentVehicle.Model.Hash, // Vehicle model hash
+                    drivingStyle,              // Driving style
+                    5.0f,                      // Stop range
+                    20.0f                      // Straighten out range
                 );
                 
-                Logger.Log("Set driving task to airport");
+                // Monitor progress to this waypoint
+                while (isActive && currentVehicle.Position.DistanceTo(waypoint) > 5.0f) {
+                    Script.Wait(100);
+                    AdjustDriving();
+                }
             }
-        } catch (Exception ex) {
+        }
+        catch (Exception ex) {
             Logger.Log("Error in DriveToDestination: " + ex.Message);
         }
+    }
+
+    private float CalculateOptimalSpeed() {
+        // Base speed in m/s
+        float baseSpeed = 20f;
+        
+        // Adjust speed based on road type and conditions
+        if (IsHighway()) {
+            baseSpeed = 35f; // About 78 mph
+        }
+        else if (IsInCity()) {
+            baseSpeed = 15f; // About 33 mph
+        }
+        
+        // Reduce speed in rain or at night
+        if (World.Weather == Weather.Raining) {
+            baseSpeed *= 0.8f;
+        }
+        if (World.CurrentTimeOfDay.Hours < 6 || World.CurrentTimeOfDay.Hours > 20) {
+            baseSpeed *= 0.9f;
+        }
+        
+        return baseSpeed;
+    }
+
+    private int CalculateDrivingStyle() {
+        // Combine different driving style flags
+        int style = 0;
+        
+        // Base flags
+        style |= 447;      // Normal driving
+        style |= 262144;   // Avoid vehicles
+        style |= 2883621;  // Avoid empty vehicles
+        style |= 786603;   // Avoid objects
+        
+        // Add more cautious behavior in certain conditions
+        if (World.Weather == Weather.Raining || 
+            World.CurrentTimeOfDay.Hours < 6 || 
+            World.CurrentTimeOfDay.Hours > 20) {
+            style |= 524288;   // Increased stopping distance
+        }
+        
+        return style;
+    }
+
+    private List<Vector3> GenerateWaypoints(Vector3 start, Vector3 end) {
+        var waypoints = new List<Vector3>();
+        
+        // Calculate total distance
+        float totalDistance = start.DistanceTo(end);
+        int numWaypoints = (int)(totalDistance / 100.0f); // One waypoint every 100 units
+        
+        for (int i = 0; i <= numWaypoints; i++) {
+            float progress = (float)i / numWaypoints;
+            Vector3 waypoint = Vector3.Lerp(start, end, progress);
+            
+            // Get nearest vehicle node
+            OutputArgument outPos = new OutputArgument();
+            Function.Call(Hash.GET_NTH_CLOSEST_VEHICLE_NODE,
+                waypoint.X, waypoint.Y, waypoint.Z,
+                1, // Get closest node
+                outPos,
+                0, 0, 0);
+            
+            waypoints.Add(outPos.GetResult<Vector3>());
+        }
+        
+        return waypoints;
+    }
+
+    private void AdjustDriving() {
+        if (currentVehicle == null) return;
+        
+        // Check for obstacles
+        var forwardVector = currentVehicle.ForwardVector;
+        var raycastResult = World.Raycast(
+            currentVehicle.Position,
+            currentVehicle.Position + (forwardVector * 10f),
+            IntersectFlags.Everything
+        );
+        
+        if (raycastResult.DidHit) {
+            // Temporary speed reduction for obstacles
+            Function.Call(Hash.SET_DRIVE_TASK_CRUISE_SPEED, 
+                Game.Player.Character.Handle, 
+                currentVehicle.Speed * 0.5f);
+                
+            Script.Wait(1000);
+        }
+        
+        // Check for dangerous turns
+        if (IsSharpTurnAhead()) {
+            Function.Call(Hash.SET_DRIVE_TASK_CRUISE_SPEED,
+                Game.Player.Character.Handle,
+                10f); // Slow down for turns
+        }
+    }
+
+    private bool IsHighway() {
+        // Get zone name at current position
+        string zoneName = Function.Call<string>(Hash.GET_NAME_OF_ZONE,
+            currentVehicle.Position.X,
+            currentVehicle.Position.Y,
+            currentVehicle.Position.Z);
+            
+        return zoneName.Contains("HIGHWAY") || zoneName.Contains("FREEWAY");
+    }
+
+    private bool IsInCity() {
+        // Get zone name at current position
+        string zoneName = Function.Call<string>(Hash.GET_NAME_OF_ZONE,
+            currentVehicle.Position.X,
+            currentVehicle.Position.Y,
+            currentVehicle.Position.Z);
+            
+        return zoneName.Contains("CITY") || zoneName.Contains("DOWNTOWN");
+    }
+
+    private bool IsSharpTurnAhead() {
+        // Ray cast ahead to detect road curvature
+        var forwardPos = currentVehicle.Position + (currentVehicle.ForwardVector * 20f);
+        
+        OutputArgument outPos = new OutputArgument();
+        Function.Call(Hash.GET_NTH_CLOSEST_VEHICLE_NODE,
+            forwardPos.X, forwardPos.Y, forwardPos.Z,
+            1,
+            outPos,
+            0, 0, 0);
+            
+        Vector3 roadNode = outPos.GetResult<Vector3>();
+        
+        // Calculate angle between current direction and road ahead
+        var directionToNode = (roadNode - currentVehicle.Position).Normalized;
+        float angle = Math.Abs(Vector3.Angle(currentVehicle.ForwardVector, directionToNode));
+        
+        return angle > 45f;
     }
     
     private void OnTick(object sender, EventArgs e) {
